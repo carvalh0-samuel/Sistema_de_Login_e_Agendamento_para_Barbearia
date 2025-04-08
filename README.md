@@ -1,2 +1,2 @@
 # Agendamento-em-Python
-Sistema de agendamento para uma barbearia em Python.
+Sistema de cadastro, login e agendamento para uma barbearia, em Python.
