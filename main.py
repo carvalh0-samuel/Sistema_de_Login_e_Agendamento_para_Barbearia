@@ -4,6 +4,7 @@ import csv
 import os
 import re
 import hashlib
+from datetime import datetime
 
 ARQUIVO_USUARIOS = "usuarios.csv"
 ARQUIVO_AGENDAMENTOS = "agendamentos.csv"
@@ -19,7 +20,6 @@ class LoginApp:
         self.criar_widgets()
 
     def verificar_arquivos(self):
-        """Cria os arquivos CSV se não existirem."""
         if not os.path.exists(ARQUIVO_USUARIOS):
             with open(ARQUIVO_USUARIOS, "w", newline="") as file:
                 writer = csv.writer(file)
@@ -31,7 +31,6 @@ class LoginApp:
                 writer.writerow(["Nome", "Data", "Hora"])
 
     def criar_widgets(self):
-        """Cria os elementos da interface."""
         self.frame = ttk.Frame(self.root)
         self.frame.pack(pady=70)
 
@@ -47,7 +46,6 @@ class LoginApp:
         self.criar_tela_cadastro()
 
     def criar_tela_login(self):
-        """Cria a interface de login."""
         ttk.Label(self.aba_login, text="E-mail:").pack(pady=15)
         self.entry_email_login = ttk.Entry(self.aba_login)
         self.entry_email_login.pack()
@@ -59,7 +57,6 @@ class LoginApp:
         ttk.Button(self.aba_login, text="Entrar", command=self.login).pack(pady=10)
 
     def criar_tela_cadastro(self):
-        """Cria a interface de cadastro."""
         ttk.Label(self.aba_cadastro, text="Nome:").pack(pady=15)
         self.entry_nome = ttk.Entry(self.aba_cadastro)
         self.entry_nome.pack()
@@ -69,8 +66,6 @@ class LoginApp:
         self.entry_email.pack()
 
         ttk.Label(self.aba_cadastro, text="Telefone:").pack(pady=15)
-        
-        # Validação para permitir apenas números e limitar a 11 caracteres
         self.valida_telefone = self.root.register(self.validar_telefone)
         self.entry_telefone = ttk.Entry(self.aba_cadastro, validate="key", validatecommand=(self.valida_telefone, "%P"))
         self.entry_telefone.pack()
@@ -82,27 +77,18 @@ class LoginApp:
         ttk.Button(self.aba_cadastro, text="Cadastrar", command=self.cadastrar).pack(pady=10)
 
     def validar_telefone(self, novo_valor):
-        """Permite apenas números e limita a 11 caracteres no campo telefone."""
-        if novo_valor.isdigit() and len(novo_valor) <= 11:
-            return True
-        return False
+        return novo_valor.isdigit() and len(novo_valor) <= 11
 
     def validar_email(self, email):
-        """Valida o formato de um e-mail."""
-        if re.match(r"[^@]+@[^@]+\.[^@]+", email):
-            return True
-        return False
+        return bool(re.match(r"[^@]+@[^@]+\.[^@]+", email))
 
     def hash_senha(self, senha):
-        """Cria um hash SHA-256 para a senha."""
         return hashlib.sha256(senha.encode('utf-8')).hexdigest()
 
     def verificar_senha(self, senha_digitada, senha_armazenada):
-        """Compara a senha digitada com a senha armazenada (em hash)."""
         return self.hash_senha(senha_digitada) == senha_armazenada
 
     def cadastrar(self):
-        """Função para cadastrar um novo usuário."""
         nome = self.entry_nome.get().strip()
         email = self.entry_email.get().strip()
         telefone = self.entry_telefone.get().strip()
@@ -118,7 +104,7 @@ class LoginApp:
 
         usuarios = self.carregar_usuarios()
 
-        if any(user[1] == email for user in usuarios):  # Verifica se o e-mail já está cadastrado
+        if any(user[1] == email for user in usuarios):
             messagebox.showwarning("Erro", "E-mail já cadastrado!")
             return
 
@@ -128,7 +114,6 @@ class LoginApp:
         self.limpar_campos()
 
     def login(self):
-        """Função para validar login."""
         email = self.entry_email_login.get().strip()
         senha = self.entry_senha_login.get().strip()
 
@@ -138,39 +123,35 @@ class LoginApp:
 
         usuarios = self.carregar_usuarios()
 
-        if any(user[1] == email and self.verificar_senha(senha, user[3]) for user in usuarios):  # Verifica o login
+        if any(user[1] == email and self.verificar_senha(senha, user[3]) for user in usuarios):
             nome = next(user[0] for user in usuarios if user[1] == email)
             messagebox.showinfo("Sucesso", f"Bem-vindo, {nome}!")
-            self.abrir_agendamento(nome)  # Abre a janela de agendamento após o login bem-sucedido
+            self.abrir_agendamento(nome)
         else:
             messagebox.showerror("Erro", "E-mail ou senha incorretos!")
 
     def carregar_usuarios(self):
-        """Carrega todos os usuários do arquivo CSV."""
         try:
             with open(ARQUIVO_USUARIOS, "r") as file:
                 reader = csv.reader(file)
-                next(reader)  # Ignora o cabeçalho
+                next(reader)
                 return [linha for linha in reader]
         except Exception as e:
             messagebox.showerror("Erro", f"Erro ao carregar usuários: {str(e)}")
             return []
 
     def salvar_usuario(self, nome, email, telefone, senha):
-        """Salva um novo usuário no arquivo CSV.""" 
         with open(ARQUIVO_USUARIOS, "a", newline="") as file:
             writer = csv.writer(file)
             writer.writerow([nome, email, telefone, senha])
 
     def limpar_campos(self):
-        """Limpa os campos de entrada após cadastro.""" 
         self.entry_nome.delete(0, tk.END)
         self.entry_email.delete(0, tk.END)
         self.entry_telefone.delete(0, tk.END)
         self.entry_senha.delete(0, tk.END)
 
     def abrir_agendamento(self, nome_usuario):
-        """Cria a janela de agendamento após o login.""" 
         agendamento_window = tk.Toplevel(self.root)
         agendamento_window.title(f"Agendamento - {nome_usuario}")
         agendamento_window.geometry("400x300")
@@ -180,62 +161,68 @@ class LoginApp:
         ttk.Label(agendamento_window, text="Data (DD/MM/AAAA):").pack(pady=5)
         entry_data = ttk.Entry(agendamento_window)
         entry_data.pack(pady=5)
-        
-        # Adicionando a formatação automática de data
         entry_data.bind("<KeyRelease>", lambda event: self.formatar_data(entry_data))
 
         ttk.Label(agendamento_window, text="Hora (HH:MM):").pack(pady=5)
         entry_hora = ttk.Entry(agendamento_window)
         entry_hora.pack(pady=5)
-        
-        # Adicionando a formatação automática de hora
         entry_hora.bind("<KeyRelease>", lambda event: self.formatar_hora(entry_hora))
 
         ttk.Button(agendamento_window, text="Agendar", command=lambda: self.confirmar_agendamento(entry_data.get(), entry_hora.get(), nome_usuario)).pack(pady=20)
 
     def formatar_data(self, entry_data):
-        """Formata automaticamente a data enquanto o usuário digita e limita o número de caracteres."""
-        data = entry_data.get().replace("/", "")  # Remove qualquer barra existente
-        if len(data) > 10:  # Limita a 10 caracteres (DD/MM/AAAA)
-            data = data[:10]
+        data = entry_data.get().replace("/", "")
+        if len(data) > 8:  # Limita a 8 caracteres (DD/MM/AAAA)
+            data = data[:8]
         if len(data) > 2:
-            data = data[:2] + "/" + data[2:]  # Adiciona a barra após o dia
+            data = data[:2] + "/" + data[2:]
         if len(data) > 5:
-            data = data[:5] + "/" + data[5:]  # Adiciona a barra após o mês
-        entry_data.delete(0, tk.END)  # Limpa o campo de entrada
-        entry_data.insert(0, data)  # Insere a data formatada
+            data = data[:5] + "/" + data[5:]
+        entry_data.delete(0, tk.END)
+        entry_data.insert(0, data)
 
     def formatar_hora(self, entry_hora):
-        """Formata automaticamente a hora enquanto o usuário digita e limita o número de caracteres."""
-        hora = entry_hora.get().replace(":", "")  # Remove qualquer dois-pontos existente
-        if len(hora) > 5:  # Limita a 5 caracteres (HH:MM)
-            hora = hora[:5]
+        hora = entry_hora.get().replace(":", "")
+        if len(hora) > 4:  # Limita a 4 caracteres (HH:MM)
+            hora = hora[:4]
         if len(hora) > 2:
-            hora = hora[:2] + ":" + hora[2:]  # Adiciona o dois-pontos após a hora
-        entry_hora.delete(0, tk.END)  # Limpa o campo de entrada
-        entry_hora.insert(0, hora)  # Insere a hora formatada
+            hora = hora[:2] + ":" + hora[2:]
+        entry_hora.delete(0, tk.END)
+        entry_hora.insert(0, hora)
+
+    def validar_data(self, data_str):
+        try:
+            data = datetime.strptime(data_str, "%d/%m/%Y")
+            if data.date() < datetime.today().date():
+                return False
+            return True
+        except ValueError:
+            return False
+
+    def validar_hora(self, hora_str):
+        try:
+            datetime.strptime(hora_str, "%H:%M")
+            return True
+        except ValueError:
+            return False
 
     def confirmar_agendamento(self, data, hora, nome_usuario):
-        """Confirma o agendamento e exibe uma mensagem.""" 
         if not data or not hora:
             messagebox.showwarning("Erro", "Preencha todos os campos de data e hora!")
             return
         
         if not self.validar_data(data):
-            messagebox.showwarning("Erro", "Data inválida! Use o formato DD/MM/AAAA.")
+            messagebox.showwarning("Erro", "Data inválida! Use o formato DD/MM/AAAA e escolha uma data futura.")
             return
         
         if not self.validar_hora(hora):
             messagebox.showwarning("Erro", "Hora inválida! Use o formato HH:MM.")
             return
         
-        # Salva o agendamento no arquivo CSV
         self.salvar_agendamento(nome_usuario, data, hora)
-
-        messagebox.showinfo("Sucesso", f"Agendamento realizado com sucesso!\nData: {data}\nHora: {hora}\nUsuário: {nome_usuario}")
+        messagebox.showinfo("Sucesso", f"Agendamento realizado!\nData: {data}\nHora: {hora}")
 
     def salvar_agendamento(self, nome, data, hora):
-        """Salva o agendamento no arquivo CSV."""
         with open(ARQUIVO_AGENDAMENTOS, "a", newline="") as file:
             writer = csv.writer(file)
             writer.writerow([nome, data, hora])
