@@ -9,6 +9,10 @@ from datetime import datetime
 ARQUIVO_USUARIOS = "usuarios.csv"
 ARQUIVO_AGENDAMENTOS = "agendamentos.csv"
 
+# Defina o e-mail e senha do dono
+EMAIL_DONO = "donobarber@example.com"
+SENHA_DONO_HASH = hashlib.sha256("senha_do_dono".encode('utf-8')).hexdigest()
+
 class LoginApp:
     def __init__(self, root):
         self.root = root
@@ -123,7 +127,12 @@ class LoginApp:
 
         usuarios = self.carregar_usuarios()
 
-        if any(user[1] == email and self.verificar_senha(senha, user[3]) for user in usuarios):
+        # Verifica se o usuário é o dono
+        if email == EMAIL_DONO and self.verificar_senha(senha, SENHA_DONO_HASH):
+            messagebox.showinfo("Sucesso", "Bem-vindo, Dono da Barbearia!")
+            self.abrir_agendamento_admin()
+        # Verifica se o e-mail e a senha correspondem a um usuário cadastrado
+        elif any(user[1] == email and self.verificar_senha(senha, user[3]) for user in usuarios):
             nome = next(user[0] for user in usuarios if user[1] == email)
             messagebox.showinfo("Sucesso", f"Bem-vindo, {nome}!")
             self.abrir_agendamento(nome)
@@ -153,7 +162,7 @@ class LoginApp:
 
     def abrir_agendamento(self, nome_usuario):
         agendamento_window = tk.Toplevel(self.root)
-        agendamento_window.title(f"Agendamento - {nome_usuario}")
+        agendamento_window.title(f"Agendamentos - {nome_usuario}")
         agendamento_window.geometry("400x300")
         
         ttk.Label(agendamento_window, text="Escolha a data e horário:").pack(pady=20)
@@ -226,6 +235,41 @@ class LoginApp:
         with open(ARQUIVO_AGENDAMENTOS, "a", newline="") as file:
             writer = csv.writer(file)
             writer.writerow([nome, data, hora])
+
+    def abrir_agendamento_admin(self):
+        # Somente o dono pode ver todos os agendamentos
+        self.visualizar_agendamentos()
+
+    def visualizar_agendamentos(self):
+        # Abre uma janela para o dono visualizar todos os agendamentos
+        janela_agendamentos = tk.Toplevel(self.root)
+        janela_agendamentos.title("Agendamentos Realizados")
+        janela_agendamentos.geometry("600x400")
+
+        agendamentos = self.carregar_agendamentos()
+
+        ttk.Label(janela_agendamentos, text="Agendamentos Realizados", font=("Arial", 16)).pack(pady=10)
+
+        tree = ttk.Treeview(janela_agendamentos, columns=("Nome", "Data", "Hora"), show="headings")
+        tree.heading("Nome", text="Nome")
+        tree.heading("Data", text="Data")
+        tree.heading("Hora", text="Hora")
+        tree.pack(expand=True, fill="both")
+
+        for agendamento in agendamentos:
+            tree.insert("", tk.END, values=agendamento)
+
+        ttk.Button(janela_agendamentos, text="Fechar", command=janela_agendamentos.destroy).pack(pady=10)
+
+    def carregar_agendamentos(self):
+        try:
+            with open(ARQUIVO_AGENDAMENTOS, "r") as file:
+                reader = csv.reader(file)
+                next(reader)
+                return [linha for linha in reader]
+        except Exception as e:
+            messagebox.showerror("Erro", f"Erro ao carregar agendamentos: {str(e)}")
+            return []
 
 # Executando a aplicação
 if __name__ == "__main__":
