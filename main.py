@@ -10,8 +10,8 @@ ARQUIVO_USUARIOS = "usuarios.csv"
 ARQUIVO_AGENDAMENTOS = "agendamentos.csv"
 
 # Defina o e-mail e senha do dono
-EMAIL_DONO = "donobarber@example.com"
-SENHA_DONO_HASH = hashlib.sha256("senha_do_dono".encode('utf-8')).hexdigest()
+EMAIL_DONO = "sam@s.com"
+SENHA_DONO_HASH = hashlib.sha256("12345".encode('utf-8')).hexdigest()
 
 class LoginApp:
     def __init__(self, root):
