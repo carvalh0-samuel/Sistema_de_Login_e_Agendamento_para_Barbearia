@@ -134,7 +134,7 @@ class AppointmentWindow(tk.Toplevel):
         super().__init__(master)
         self.db = db; self.user = user
         self.title(f"Agendamentos{' - ' + user[1] if user else ''}")
-        self.geometry("980x660")
+        self.geometry("1020x580")
         # Campo de busca para o dono
         if not user:
             sf = ttk.Frame(self); sf.pack(fill=tk.X, pady=5, padx=5)
@@ -223,7 +223,7 @@ class LoginApp(tk.Tk):
         super().__init__()
         self.db = Database()
         self.title("Sistema de Login e Cadastro")
-        self.geometry("980x660")
+        self.geometry("1020x580")
         self.resizable(False, False)
 
         try:
@@ -231,7 +231,7 @@ class LoginApp(tk.Tk):
         except:
             pass
         try:
-            bg = Image.open("imagens/background.png").resize((980,660), Image.LANCZOS)
+            bg = Image.open("imagens/background.png").resize((1020,580), Image.LANCZOS)
             self._bg = ImageTk.PhotoImage(bg)
             tk.Label(self, image=self._bg).place(relwidth=1, relheight=1)
         except:
