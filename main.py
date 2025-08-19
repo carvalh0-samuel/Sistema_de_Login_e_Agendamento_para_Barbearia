@@ -1,6 +1,6 @@
 import tkinter as tk
 from tkinter import ttk, messagebox
-from PIL import Image, ImageTk
+from PIL import Image, ImageTk, ImageDraw
 import sqlite3
 import re
 import hashlib
@@ -258,36 +258,118 @@ class LoginApp(tk.Tk):
         self.geometry("1020x580")
         self.resizable(False, False)
 
-        # Tenta carregar ícone e background (se existirem)
+        # Tenta carregar ícone (se existir)
         try:
             self.iconphoto(False, tk.PhotoImage(file="imagens/icon.png"))
         except:
             pass
-        try:
-            bg = Image.open("imagens/background.png").resize((1020,580), Image.LANCZOS)
-            self._bg = ImageTk.PhotoImage(bg)
-            tk.Label(self, image=self._bg).place(relwidth=1, relheight=1)
-        except:
-            pass
 
+        # substituímos o Label de background por um Canvas na UI (feito no _build_ui)
         self._build_ui()
 
-    # Constrói interface de login/cadastro
+    def _make_rounded_panel(self, w, h, radius=12, alpha=200, color=(240,240,240)):
+        """Cria imagem RGBA com cantos arredondados para servir de painel semi-transparente."""
+        img = Image.new("RGBA", (w, h), (0, 0, 0, 0))
+        mask = Image.new("L", (w, h), 0)
+        mdraw = ImageDraw.Draw(mask)
+        mdraw.rounded_rectangle((0,0,w,h), radius=radius, fill=alpha)
+        color_layer = Image.new("RGBA", (w, h), color + (0,))
+        color_layer.putalpha(mask)
+        return color_layer
+
     def _build_ui(self):
-        nb = ttk.Notebook(self)
-        panels = [
-            ('Login', [('E-mail', False), ('Senha', True)], self._do_login),
-            ('Cadastro', [('Nome', False), ('E-mail', False), ('Telefone', False), ('Senha', True)], self._do_register)
-        ]
-        for title, fields, action in panels:
-            frame = ttk.Frame(nb); entries = {}
-            for label, pwd in fields:
-                ttk.Label(frame, text=label + ":").pack(pady=3)
-                e = ttk.Entry(frame, show='*' if pwd else ''); e.pack()
-                entries[label] = e
-            ttk.Button(frame, text=title, command=lambda e=entries, a=action: a(e)).pack(pady=10)
-            nb.add(frame, text=title)
-        nb.place(relx=0.5, rely=0.5, anchor='center', width=300, height=300)
+        # tenta carregar o background; se falhar cria um background neutro
+        try:
+            self._orig_bg = Image.open("imagens/background.png").convert("RGB")
+        except Exception:
+            self._orig_bg = Image.new("RGB", (1020, 580), (50, 50, 50))
+
+        # Canvas que conterá o fundo e os widgets
+        w, h = 1020, 580
+        self.canvas = tk.Canvas(self, width=w, height=h, highlightthickness=0)
+        self.canvas.pack(fill='both', expand=True)
+
+        # imagem de fundo (referência guardada em self para evitar GC)
+        self._bg_photo = ImageTk.PhotoImage(self._orig_bg.resize((w, h), Image.LANCZOS))
+        self._bg_id = self.canvas.create_image(0, 0, anchor='nw', image=self._bg_photo)
+
+        # painel semi-transparente (card) no centro
+        panel_w, panel_h = 360, 320
+        overlay = self._make_rounded_panel(panel_w, panel_h, radius=12, alpha=220, color=(240,240,240))
+        self._overlay_photo = ImageTk.PhotoImage(overlay)
+        cx, cy = w // 2, h // 2
+        self._panel_id = self.canvas.create_image(cx, cy, image=self._overlay_photo)
+
+        # abas simples (botões) - posicionados sobre o painel
+        b_login = tk.Button(self, text="Login", relief="flat", command=lambda: self._show_tab("login"))
+        b_register = tk.Button(self, text="Cadastro", relief="flat", command=lambda: self._show_tab("register"))
+        self._tab_login_id = self.canvas.create_window(cx - 60, cy - panel_h//2 + 16, window=b_login)
+        self._tab_register_id = self.canvas.create_window(cx + 40, cy - panel_h//2 + 16, window=b_register)
+
+        # --- Widgets de Login ---
+        entries_login = {}
+        lbl_e = tk.Label(self, text="E-mail:")
+        ent_e = tk.Entry(self, width=30)
+        lbl_s = tk.Label(self, text="Senha:")
+        ent_s = tk.Entry(self, width=30, show="*")
+        btn_login = tk.Button(self, text="Login", width=12, command=lambda e=entries_login: self._do_login(e))
+
+        # posicionamento (coord relativas ao centro do painel)
+        base_y = cy - 40
+        self._login_ids = {
+            "lbl_e": self.canvas.create_window(cx, base_y - 40, window=lbl_e),
+            "ent_e": self.canvas.create_window(cx, base_y - 20, window=ent_e),
+            "lbl_s": self.canvas.create_window(cx, base_y + 10, window=lbl_s),
+            "ent_s": self.canvas.create_window(cx, base_y + 30, window=ent_s),
+            "btn": self.canvas.create_window(cx, base_y + 90, window=btn_login)
+        }
+        entries_login["E-mail"] = ent_e
+        entries_login["Senha"] = ent_s
+        self._entries_login = entries_login
+
+        # --- limitar caracteres de telefone ---
+        vcmd = (self.register(lambda P: P.isdigit() and len(P) <= 11 or P == ""), "%P")
+
+        # --- Widgets de Cadastro ---
+        entries_reg = {}
+        spacing = 46
+        r_base = cy - 60
+        lbl_nome = tk.Label(self, text="Nome:")
+        ent_nome = tk.Entry(self, width=30)
+        lbl_email = tk.Label(self, text="E-mail:")
+        ent_email = tk.Entry(self, width=30)
+        lbl_tel = tk.Label(self, text="Telefone:")
+        ent_tel = tk.Entry(self, width=30, validate="key", validatecommand=vcmd)
+        lbl_pwd = tk.Label(self, text="Senha:")
+        ent_pwd = tk.Entry(self, width=30, show="*")
+        btn_reg = tk.Button(self, text="Cadastrar", width=12, command=lambda e=entries_reg: self._do_register(e))
+
+        self._reg_ids = {
+            "lbl_nome": self.canvas.create_window(cx, r_base - 4, window=lbl_nome),
+            "ent_nome": self.canvas.create_window(cx, r_base + 14, window=ent_nome),
+            "lbl_email": self.canvas.create_window(cx, r_base + spacing, window=lbl_email),
+            "ent_email": self.canvas.create_window(cx, r_base + spacing + 14, window=ent_email),
+            "lbl_tel": self.canvas.create_window(cx, r_base + spacing*2, window=lbl_tel),
+            "ent_tel": self.canvas.create_window(cx, r_base + spacing*2 + 14, window=ent_tel),
+            "lbl_pwd": self.canvas.create_window(cx, r_base + spacing*3, window=lbl_pwd),
+            "ent_pwd": self.canvas.create_window(cx, r_base + spacing*3 + 14, window=ent_pwd),
+            "btn": self.canvas.create_window(cx, r_base + spacing*4 + 6, window=btn_reg)
+        }
+        entries_reg["Nome"] = ent_nome
+        entries_reg["E-mail"] = ent_email
+        entries_reg["Telefone"] = ent_tel
+        entries_reg["Senha"] = ent_pwd
+        self._entries_reg = entries_reg
+
+        # mostra login por padrão
+        self._show_tab("login")
+
+    def _show_tab(self, name):
+        # mostra/oculta widgets de login e registro
+        for k, id_ in self._login_ids.items():
+            self.canvas.itemconfigure(id_, state="normal" if name == "login" else "hidden")
+        for k, id_ in self._reg_ids.items():
+            self.canvas.itemconfigure(id_, state="normal" if name == "register" else "hidden")
 
     # Cadastro de novo usuário
     def _do_register(self, entries):
