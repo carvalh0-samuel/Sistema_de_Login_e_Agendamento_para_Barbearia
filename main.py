@@ -1,186 +1,390 @@
-import tkinter as tk
-from tkinter import ttk, messagebox
-from PIL import Image, ImageTk, ImageDraw
-import sqlite3
-import re
+"""Sistema de login, cadastro e agendamentos (Tkinter + SQLite)."""
+
 import hashlib
-from datetime import datetime, date
+import hmac
+import os
+import re
+import secrets
+import sqlite3
+import tkinter as tk
+from contextlib import closing
+from datetime import date, datetime
+from tkinter import messagebox, ttk
 
-# Arquivo do banco de dados
+from PIL import Image, ImageDraw, ImageTk
+
+# ----------------------------------------------------------------------------
+# Configuração
+# ----------------------------------------------------------------------------
 DB_FILE = "app.db"
-# Credenciais fixas do dono do sistema
-EMAIL_DONO = "sam@s.com"
-SENHA_DONO_HASH = hashlib.sha256("12345".encode()).hexdigest()
 
-# Função para gerar hash da senha
+# Credenciais do dono. Para uso real, defina as variáveis de ambiente
+# OWNER_EMAIL e OWNER_PASSWORD em vez de deixar valores fixos no código.
+OWNER_EMAIL = os.environ.get("OWNER_EMAIL", "sam@s.com")
+OWNER_PASSWORD = os.environ.get("OWNER_PASSWORD", "12345")
+
+PBKDF2_ITERATIONS = 200_000
+MIN_PASSWORD_LEN = 6
+PANEL_BG = "#f0f0f0"
+
+
+# ----------------------------------------------------------------------------
+# Segurança
+# ----------------------------------------------------------------------------
 def hash_password(pwd):
-    return hashlib.sha256(pwd.encode()).hexdigest()
+    """Gera hash PBKDF2 com salt aleatório: 'pbkdf2$<salt>$<hash>'."""
+    salt = secrets.token_bytes(16)
+    digest = hashlib.pbkdf2_hmac("sha256", pwd.encode(), salt, PBKDF2_ITERATIONS)
+    return f"pbkdf2${salt.hex()}${digest.hex()}"
 
-# Classe para manipulação do banco de dados
+
+def verify_password(pwd, stored):
+    """Confere a senha. Aceita também o formato antigo (SHA-256 puro)."""
+    if stored.startswith("pbkdf2$"):
+        try:
+            _, salt_hex, digest_hex = stored.split("$")
+        except ValueError:
+            return False
+        calc = hashlib.pbkdf2_hmac(
+            "sha256", pwd.encode(), bytes.fromhex(salt_hex), PBKDF2_ITERATIONS
+        )
+        return hmac.compare_digest(calc.hex(), digest_hex)
+    legacy = hashlib.sha256(pwd.encode()).hexdigest()
+    return hmac.compare_digest(legacy, stored)
+
+
+def needs_rehash(stored):
+    return not stored.startswith("pbkdf2$")
+
+
+def is_owner(email, pwd):
+    ok_email = hmac.compare_digest(email.lower().encode(), OWNER_EMAIL.lower().encode())
+    ok_pwd = hmac.compare_digest(pwd.encode(), OWNER_PASSWORD.encode())
+    return ok_email and ok_pwd
+
+
+# ----------------------------------------------------------------------------
+# Utilidades de data/hora (funções puras, fáceis de testar)
+# ----------------------------------------------------------------------------
+def format_date_text(raw):
+    """Aplica a máscara DD/MM/AAAA."""
+    digits = re.sub(r"\D", "", raw)[:8]
+    out = digits[:2]
+    if len(digits) > 2:
+        out += "/" + digits[2:4]
+    if len(digits) > 4:
+        out += "/" + digits[4:]
+    return out
+
+
+def format_time_text(raw):
+    """Aplica a máscara HH:MM."""
+    digits = re.sub(r"\D", "", raw)[:4]
+    out = digits[:2]
+    if len(digits) > 2:
+        out += ":" + digits[2:]
+    return out
+
+
+def parse_date(text):
+    return datetime.strptime(text, "%d/%m/%Y").date()
+
+
+def iso_to_br(iso_text):
+    year, month, day = iso_text.split("-")
+    return f"{day}/{month}/{year}"
+
+
+def format_created(iso_text):
+    try:
+        return datetime.fromisoformat(iso_text).strftime("%d/%m/%Y %H:%M")
+    except ValueError:
+        return iso_text
+
+
+def validate_slot(date_text, time_text, partial=False):
+    """Retorna uma mensagem de erro ou None se estiver tudo certo.
+
+    Com partial=True, campos incompletos não geram erro (feedback enquanto digita).
+    """
+    day = None
+    if len(date_text) == 10:
+        try:
+            day = parse_date(date_text)
+        except ValueError:
+            return "Data inválida."
+        if day < date.today():
+            return "A data não pode estar no passado."
+    elif not partial:
+        return "Informe a data completa (DD/MM/AAAA)."
+
+    moment = None
+    if len(time_text) == 5:
+        try:
+            moment = datetime.strptime(time_text, "%H:%M").time()
+        except ValueError:
+            return "Hora inválida."
+    elif not partial:
+        return "Informe a hora completa (HH:MM)."
+
+    if day and moment and datetime.combine(day, moment) <= datetime.now():
+        return "O horário não pode estar no passado."
+    return None
+
+
+# ----------------------------------------------------------------------------
+# Banco de dados
+# ----------------------------------------------------------------------------
+SCHEMA = """
+CREATE TABLE IF NOT EXISTS users (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    nome TEXT NOT NULL,
+    email TEXT UNIQUE NOT NULL,
+    telefone TEXT,
+    senha_hash TEXT NOT NULL,
+    criado_em TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS appointments (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER NOT NULL,
+    data TEXT NOT NULL,          -- formato ISO: AAAA-MM-DD
+    hora TEXT NOT NULL,          -- formato HH:MM
+    criado_em TEXT NOT NULL,
+    FOREIGN KEY(user_id) REFERENCES users(id)
+);
+CREATE INDEX IF NOT EXISTS idx_appointments_slot ON appointments (data, hora);
+"""
+
+# Converte registros antigos (DD/MM/AAAA) para o formato ISO.
+MIGRATE_DATES = """
+UPDATE appointments
+SET data = substr(data, 7, 4) || '-' || substr(data, 4, 2) || '-' || substr(data, 1, 2)
+WHERE data LIKE '__/__/____'
+"""
+
+
+def _like(term):
+    """Escapa curingas do LIKE para a busca ser literal."""
+    esc = term.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+    return f"%{esc}%"
+
+
 class Database:
     def __init__(self, db_file=DB_FILE):
         self.db_file = db_file
-        self._initialize()  # Cria tabelas caso não existam
+        self._initialize()
+
+    def _connect(self):
+        conn = sqlite3.connect(self.db_file)
+        conn.execute("PRAGMA foreign_keys = ON")
+        return conn
+
+    def _execute(self, sql, params=(), fetch=None):
+        with closing(self._connect()) as conn, conn:
+            cur = conn.execute(sql, params)
+            if fetch == "one":
+                return cur.fetchone()
+            if fetch == "all":
+                return cur.fetchall()
+            return cur.lastrowid
 
     def _initialize(self):
-        # Criação das tabelas: usuários e agendamentos
-        schema = """
-        CREATE TABLE IF NOT EXISTS users (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            nome TEXT NOT NULL,
-            email TEXT UNIQUE NOT NULL,
-            telefone TEXT,
-            senha_hash TEXT NOT NULL,
-            criado_em TEXT NOT NULL
-        );
-        CREATE TABLE IF NOT EXISTS appointments (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER NOT NULL,
-            data TEXT NOT NULL,
-            hora TEXT NOT NULL,
-            criado_em TEXT NOT NULL,
-            FOREIGN KEY(user_id) REFERENCES users(id)
-        );
-        """
-        with sqlite3.connect(self.db_file) as conn:
-            conn.executescript(schema)
+        with closing(self._connect()) as conn, conn:
+            conn.executescript(SCHEMA)
+            conn.execute(MIGRATE_DATES)
 
-    # Adiciona novo usuário
+    # --- usuários ---------------------------------------------------------
     def add_user(self, nome, email, telefone, senha_hash):
-        criado = datetime.now().isoformat()
-        with sqlite3.connect(self.db_file) as conn:
-            conn.execute(
-                "INSERT INTO users (nome, email, telefone, senha_hash, criado_em) VALUES (?, ?, ?, ?, ?)",
-                (nome, email, telefone, senha_hash, criado)
-            )
+        return self._execute(
+            "INSERT INTO users (nome, email, telefone, senha_hash, criado_em)"
+            " VALUES (?, ?, ?, ?, ?)",
+            (nome, email, telefone, senha_hash, datetime.now().isoformat()),
+        )
 
-    # Busca usuário pelo e-mail
     def get_user_by_email(self, email):
-        with sqlite3.connect(self.db_file) as conn:
-            return conn.execute("SELECT * FROM users WHERE email = ?", (email,)).fetchone()
+        return self._execute(
+            "SELECT * FROM users WHERE lower(email) = lower(?)", (email,), fetch="one"
+        )
 
-    # Adiciona agendamento
-    def add_appointment(self, user_id, data, hora):
-        criado = datetime.now().isoformat()
-        with sqlite3.connect(self.db_file) as conn:
-            conn.execute(
-                "INSERT INTO appointments (user_id, data, hora, criado_em) VALUES (?, ?, ?, ?)",
-                (user_id, data, hora, criado)
-            )
+    def update_password_hash(self, user_id, senha_hash):
+        self._execute("UPDATE users SET senha_hash = ? WHERE id = ?", (senha_hash, user_id))
 
-    # Retorna agendamentos (com filtros opcionais por usuário e busca)
+    # --- agendamentos -----------------------------------------------------
+    def slot_taken(self, data_iso, hora, exclude_id=0):
+        row = self._execute(
+            "SELECT 1 FROM appointments WHERE data = ? AND hora = ? AND id != ?",
+            (data_iso, hora, exclude_id),
+            fetch="one",
+        )
+        return row is not None
+
+    def add_appointment(self, user_id, data_iso, hora):
+        return self._execute(
+            "INSERT INTO appointments (user_id, data, hora, criado_em) VALUES (?, ?, ?, ?)",
+            (user_id, data_iso, hora, datetime.now().isoformat()),
+        )
+
+    def get_appointment(self, appt_id):
+        return self._execute(
+            "SELECT id, user_id, data, hora FROM appointments WHERE id = ?",
+            (appt_id,),
+            fetch="one",
+        )
+
     def get_appointments(self, user_id=None, search=None):
         query = (
             "SELECT a.id, u.nome, a.data, a.hora, a.criado_em"
-            " FROM appointments a JOIN users u ON a.user_id=u.id"
+            " FROM appointments a JOIN users u ON a.user_id = u.id"
         )
-        params = []
-        if user_id:
-            query += " WHERE a.user_id = ?"
+        clauses, params = [], []
+        if user_id is not None:
+            clauses.append("a.user_id = ?")
             params.append(user_id)
         if search:
-            prefix = " AND" if 'WHERE' in query else " WHERE"
-            query += f"{prefix} (u.nome LIKE ? OR a.data LIKE ?)"
-            params.extend((f"%{search}%", f"%{search}%"))
-        # Ordena por data e hora
-        query += (
-            " ORDER BY substr(a.data, 7, 4) || '-' || substr(a.data, 4, 2) || '-' || substr(a.data, 1, 2), a.hora"
-        )
-        with sqlite3.connect(self.db_file) as conn:
-            return conn.execute(query, params).fetchall()
-
-    # Atualiza agendamento
-    def update_appointment(self, appt_id, data, hora):
-        with sqlite3.connect(self.db_file) as conn:
-            conn.execute(
-                "UPDATE appointments SET data = ?, hora = ? WHERE id = ?",
-                (data, hora, appt_id)
+            like = _like(search)
+            clauses.append(
+                "(u.nome LIKE ? ESCAPE '\\' OR a.data LIKE ? ESCAPE '\\'"
+                " OR (substr(a.data, 9, 2) || '/' || substr(a.data, 6, 2) || '/' || substr(a.data, 1, 4))"
+                " LIKE ? ESCAPE '\\')"
             )
+            params.extend((like, like, like))
+        if clauses:
+            query += " WHERE " + " AND ".join(clauses)
+        query += " ORDER BY a.data, a.hora"
+        return self._execute(query, params, fetch="all")
 
-    # Deleta agendamento
+    def update_appointment(self, appt_id, data_iso, hora):
+        self._execute(
+            "UPDATE appointments SET data = ?, hora = ? WHERE id = ?",
+            (data_iso, hora, appt_id),
+        )
+
     def delete_appointment(self, appt_id):
-        with sqlite3.connect(self.db_file) as conn:
-            conn.execute("DELETE FROM appointments WHERE id = ?", (appt_id,))
+        self._execute("DELETE FROM appointments WHERE id = ?", (appt_id,))
 
 
-# Classe para validações de data e hora
-class Validator:
+# ----------------------------------------------------------------------------
+# Formulário de agendamento (adicionar / editar)
+# ----------------------------------------------------------------------------
+class AppointmentForm(tk.Toplevel):
+    def __init__(self, master, db, user_id, on_saved, appt=None):
+        super().__init__(master)
+        self.db, self.user_id, self.on_saved = db, user_id, on_saved
+        self.appt_id = appt[0] if appt else None
+
+        self.title("Editar agendamento" if appt else "Novo agendamento")
+        self.resizable(False, False)
+        self.transient(master)
+
+        frame = ttk.Frame(self, padding=16)
+        frame.pack()
+
+        ttk.Label(frame, text="Data (DD/MM/AAAA)").pack(pady=(0, 2))
+        self.date_entry = ttk.Entry(frame, width=22, justify="center")
+        self.date_entry.pack(pady=(0, 8))
+
+        ttk.Label(frame, text="Hora (HH:MM)").pack(pady=(0, 2))
+        self.time_entry = ttk.Entry(frame, width=22, justify="center")
+        self.time_entry.pack(pady=(0, 8))
+
+        self.error_var = tk.StringVar()
+        tk.Label(frame, textvariable=self.error_var, fg="#b00020", wraplength=220).pack()
+
+        ttk.Button(frame, text="Confirmar", command=self._save).pack(pady=(8, 0))
+
+        if appt:
+            self.date_entry.insert(0, iso_to_br(appt[2]))
+            self.time_entry.insert(0, appt[3])
+
+        for entry in (self.date_entry, self.time_entry):
+            entry.bind("<KeyRelease>", self._on_key)
+        self.bind("<Return>", lambda _e: self._save())
+        self.bind("<Escape>", lambda _e: self.destroy())
+
+        self.date_entry.focus_set()
+        self.grab_set()
+
     @staticmethod
-    def _validate_date(entry, show=True):
-        # Formata a entrada de data automaticamente
-        txt = entry.get().replace('/', '')[:8]
-        if len(txt) > 2: txt = f"{txt[:2]}/{txt[2:]}"
-        if len(txt) > 5: txt = f"{txt[:5]}/{txt[5:]}"
-        entry.delete(0, tk.END); entry.insert(0, txt)
+    def _reformat(entry, formatter):
+        current = entry.get()
+        new = formatter(current)
+        if current != new:
+            entry.delete(0, tk.END)
+            entry.insert(0, new)
 
-        # Só valida se estiver completo
-        if len(txt) < 10: return True
-        try:
-            date_obj = datetime.strptime(txt, "%d/%m/%Y").date()
-            # Data não pode ser no passado
-            if date_obj < date.today(): raise ValueError
-            return True
-        except ValueError:
-            if show: messagebox.showwarning("Erro", "Data inválida ou no passado.")
-            return False
+    def _on_key(self, _event=None):
+        self._reformat(self.date_entry, format_date_text)
+        self._reformat(self.time_entry, format_time_text)
+        self.error_var.set(
+            validate_slot(self.date_entry.get(), self.time_entry.get(), partial=True) or ""
+        )
 
-    @staticmethod
-    def _validate_time(entry, show=True):
-        # Formata a entrada de hora automaticamente
-        txt = entry.get().replace(':', '')[:4]
-        if len(txt) > 2: txt = f"{txt[:2]}:{txt[2:]}"
-        entry.delete(0, tk.END); entry.insert(0, txt)
+    def _save(self):
+        date_text = self.date_entry.get().strip()
+        time_text = self.time_entry.get().strip()
 
-        # Só valida se estiver completo
-        if len(txt) < 5: return True
-        try:
-            input_time = datetime.strptime(txt, "%H:%M").time()
-            # Obtém a data associada para checar se é no mesmo dia
-            parent = entry.master; date_entry = None
-            for child in parent.winfo_children():
-                if isinstance(child, ttk.Entry) and child != entry:
-                    date_entry = child; break
-            if date_entry:
-                input_date = datetime.strptime(date_entry.get(), "%d/%m/%Y").date()
-                # Se for hoje, hora não pode ser no passado
-                if input_date == date.today() and input_time <= datetime.now().time():
-                    raise ValueError
-            return True
-        except Exception:
-            if show: messagebox.showwarning("Erro", "Hora inválida ou no passado.")
-            return False
+        error = validate_slot(date_text, time_text)
+        if error:
+            self.error_var.set(error)
+            return
+
+        date_iso = parse_date(date_text).isoformat()
+        if self.db.slot_taken(date_iso, time_text, exclude_id=self.appt_id or 0):
+            self.error_var.set("Esse horário já está reservado.")
+            return
+
+        if self.appt_id:
+            self.db.update_appointment(self.appt_id, date_iso, time_text)
+        else:
+            self.db.add_appointment(self.user_id, date_iso, time_text)
+
+        self.on_saved()
+        self.destroy()
 
 
+# ----------------------------------------------------------------------------
 # Janela de agendamentos
+# ----------------------------------------------------------------------------
 class AppointmentWindow(tk.Toplevel):
+    TABS = ("Futuros", "Passados")
+    COLUMNS = ("ID", "Nome", "Data", "Hora", "Criado em")
+    WIDTHS = {"ID": 60, "Nome": 300, "Data": 130, "Hora": 100, "Criado em": 200}
+
     def __init__(self, master, db, user=None):
         super().__init__(master)
-        self.db = db; self.user = user
+        self.db, self.user = db, user  # user=None -> visão do dono
         self.title(f"Agendamentos{' - ' + user[1] if user else ''}")
         self.geometry("1020x580")
 
-        # Campo de busca aparece apenas para o dono
+        self.search_var = tk.StringVar()
         if not user:
-            sf = ttk.Frame(self); sf.pack(fill=tk.X, pady=5, padx=5)
-            tk.Label(sf, text="Buscar:").pack(side=tk.LEFT)
-            self.search_var = tk.StringVar()
-            tk.Entry(sf, textvariable=self.search_var).pack(side=tk.LEFT, padx=5)
+            sf = ttk.Frame(self)
+            sf.pack(fill=tk.X, pady=5, padx=5)
+            ttk.Label(sf, text="Buscar (nome ou data):").pack(side=tk.LEFT)
+            entry = ttk.Entry(sf, textvariable=self.search_var, width=30)
+            entry.pack(side=tk.LEFT, padx=5)
+            entry.bind("<Return>", lambda _e: self.refresh())
             ttk.Button(sf, text="Pesquisar", command=self.refresh).pack(side=tk.LEFT)
+            ttk.Button(sf, text="Limpar", command=self._clear_search).pack(side=tk.LEFT, padx=5)
 
-        # Abas internas: Futuros / Passados
-        inner_nb = ttk.Notebook(self); inner_nb.pack(expand=True, fill='both', pady=5, padx=5)
-        self.frames = {}
-        for tab in ("Futuros", "Passados"):
-            frm = ttk.Frame(inner_nb); inner_nb.add(frm, text=tab)
-            # Tabela de agendamentos
-            tv = ttk.Treeview(frm, columns=("ID","Nome","Data","Hora","Criado em"), show="headings")
-            for col in ("ID","Nome","Data","Hora","Criado em"):
-                tv.heading(col, text=col); tv.column(col, anchor="center")
-            tv.pack(expand=True, fill='both')
-            self.frames[tab] = tv
+        self.notebook = ttk.Notebook(self)
+        self.notebook.pack(expand=True, fill="both", pady=5, padx=5)
+        self.trees = {}
+        for tab in self.TABS:
+            frm = ttk.Frame(self.notebook)
+            self.notebook.add(frm, text=tab)
+            tv = ttk.Treeview(frm, columns=self.COLUMNS, show="headings", selectmode="browse")
+            for col in self.COLUMNS:
+                tv.heading(col, text=col)
+                tv.column(col, anchor="center", width=self.WIDTHS[col])
+            sb = ttk.Scrollbar(frm, orient="vertical", command=tv.yview)
+            tv.configure(yscrollcommand=sb.set)
+            sb.pack(side=tk.RIGHT, fill=tk.Y)
+            tv.pack(expand=True, fill="both")
+            self.trees[tab] = tv
 
-        # Botões de ação
-        btns = ttk.Frame(self); btns.pack(pady=5)
+        btns = ttk.Frame(self)
+        btns.pack(pady=5)
         if user:
             ttk.Button(btns, text="Adicionar", command=self.add).pack(side=tk.LEFT, padx=5)
             ttk.Button(btns, text="Editar", command=self.edit).pack(side=tk.LEFT, padx=5)
@@ -189,222 +393,246 @@ class AppointmentWindow(tk.Toplevel):
 
         self.refresh()
 
+    def _clear_search(self):
+        self.search_var.set("")
+        self.refresh()
+
     def refresh(self):
-        # Limpa todas as tabelas
-        for tv in self.frames.values():
-            for iid in tv.get_children(): tv.delete(iid)
-        # Busca registros do banco
-        term = self.search_var.get().strip() if hasattr(self, 'search_var') else None
-        appts = self.db.get_appointments(user_id=(self.user[0] if self.user else None), search=term)
-        # Classifica em futuros ou passados
-        for a in appts:
-            appt_date = datetime.strptime(a[2], "%d/%m/%Y").date()
-            tab = "Futuros" if appt_date >= date.today() else "Passados"
-            self.frames[tab].insert("", tk.END, values=a)
+        for tv in self.trees.values():
+            tv.delete(*tv.get_children())
 
-    # Abre formulário para adicionar agendamento
-    def add(self): self._open_form('add')
-    # Abre formulário para editar agendamento selecionado
+        term = self.search_var.get().strip() or None
+        appts = self.db.get_appointments(
+            user_id=self.user[0] if self.user else None, search=term
+        )
+        now = datetime.now()
+        for appt_id, nome, data_iso, hora, criado in appts:
+            when = datetime.strptime(f"{data_iso} {hora}", "%Y-%m-%d %H:%M")
+            tab = "Futuros" if when >= now else "Passados"
+            # Passados em ordem decrescente (mais recentes primeiro)
+            position = 0 if tab == "Passados" else tk.END
+            self.trees[tab].insert(
+                "",
+                position,
+                iid=str(appt_id),
+                values=(appt_id, nome, iso_to_br(data_iso), hora, format_created(criado)),
+            )
+
+    def _selected(self):
+        """Retorna (aba, id) do item selecionado na aba atual, ou None."""
+        tab = self.notebook.tab(self.notebook.select(), "text")
+        selection = self.trees[tab].selection()
+        if not selection:
+            messagebox.showinfo("Atenção", "Selecione um agendamento.", parent=self)
+            return None
+        return tab, int(selection[0])
+
+    def _own_appointment(self, appt_id):
+        """Busca o agendamento garantindo que pertence ao usuário logado."""
+        appt = self.db.get_appointment(appt_id)
+        if not appt or appt[1] != self.user[0]:
+            messagebox.showerror("Erro", "Agendamento não encontrado.", parent=self)
+            self.refresh()
+            return None
+        return appt
+
+    def add(self):
+        AppointmentForm(self, self.db, self.user[0], self.refresh)
+
     def edit(self):
-        for tv in self.frames.values():
-            sel = tv.focus()
-            if sel:
-                vals = tv.item(sel, 'values')
-                return self._open_form('edit', vals)
-    # Exclui agendamento selecionado
-    def delete(self):
-        for tv in self.frames.values():
-            sel = tv.focus()
-            if sel and messagebox.askyesno("Confirmar", "Excluir agendamento?", parent=self):
-                self.db.delete_appointment(tv.item(sel)['values'][0])
-                return self.refresh()
-
-    # Formulário de agendamento (inclusão/edição)
-    def _open_form(self, mode, appt=None):
-        form = tk.Toplevel(self); form.title("Agendamento")
-        entries = {}
-        # Campos: Data e Hora
-        for label, validator in [('Data (DD/MM/AAAA)', Validator._validate_date), ('Hora (HH:MM)', Validator._validate_time)]:
-            ttk.Label(form, text=label).pack(pady=2)
-            e = ttk.Entry(form); e.pack(pady=2)
-            e.bind('<KeyRelease>', lambda ev, e=e, v=validator: v(e))
-            entries[label] = e
+        selected = self._selected()
+        if not selected:
+            return
+        tab, appt_id = selected
+        if tab == "Passados":
+            messagebox.showinfo("Atenção", "Agendamentos passados não podem ser editados.", parent=self)
+            return
+        appt = self._own_appointment(appt_id)
         if appt:
-            entries['Data (DD/MM/AAAA)'].insert(0, appt[2])
-            entries['Hora (HH:MM)'].insert(0, appt[3])
+            AppointmentForm(self, self.db, self.user[0], self.refresh, appt=appt)
 
-        # Botão confirmar
-        def confirm():
-            d = entries['Data (DD/MM/AAAA)'].get().strip()
-            h = entries['Hora (HH:MM)'].get().strip()
-            if not Validator._validate_date(entries['Data (DD/MM/AAAA)'], show=False) \
-               or not Validator._validate_time(entries['Hora (HH:MM)'], show=False):
-                return
-            if mode == 'add':
-                self.db.add_appointment(self.user[0], d, h)
-            else:
-                self.db.update_appointment(appt[0], d, h)
-            form.destroy(); self.refresh()
-
-        ttk.Button(form, text="Confirmar", command=confirm).pack(pady=5)
+    def delete(self):
+        selected = self._selected()
+        if not selected:
+            return
+        _, appt_id = selected
+        if not self._own_appointment(appt_id):
+            return
+        if messagebox.askyesno("Confirmar", "Excluir agendamento?", parent=self):
+            self.db.delete_appointment(appt_id)
+            self.refresh()
 
 
+# ----------------------------------------------------------------------------
 # Janela principal (Login e Cadastro)
+# ----------------------------------------------------------------------------
 class LoginApp(tk.Tk):
+    W, H = 1020, 580
+    PANEL_W, PANEL_H = 360, 320
+
     def __init__(self):
         super().__init__()
         self.db = Database()
         self.title("Sistema de Login e Cadastro")
-        self.geometry("1020x580")
+        self.geometry(f"{self.W}x{self.H}")
         self.resizable(False, False)
 
-        # Tenta carregar ícone (se existir)
         try:
             self.iconphoto(False, tk.PhotoImage(file="imagens/icon.png"))
-        except:
-            pass
+        except tk.TclError:
+            pass  # ícone é opcional
 
-        # substituímos o Label de background por um Canvas na UI (feito no _build_ui)
         self._build_ui()
 
-    def _make_rounded_panel(self, w, h, radius=12, alpha=200, color=(240,240,240)):
-        """Cria imagem RGBA com cantos arredondados para servir de painel semi-transparente."""
-        img = Image.new("RGBA", (w, h), (0, 0, 0, 0))
+    @staticmethod
+    def _make_rounded_panel(w, h, radius=12, alpha=255, color=(240, 240, 240)):
+        """Cria uma imagem RGBA com cantos arredondados para servir de painel."""
         mask = Image.new("L", (w, h), 0)
-        mdraw = ImageDraw.Draw(mask)
-        mdraw.rounded_rectangle((0,0,w,h), radius=radius, fill=alpha)
-        color_layer = Image.new("RGBA", (w, h), color + (0,))
-        color_layer.putalpha(mask)
-        return color_layer
+        ImageDraw.Draw(mask).rounded_rectangle((0, 0, w - 1, h - 1), radius=radius, fill=alpha)
+        panel = Image.new("RGBA", (w, h), color + (0,))
+        panel.putalpha(mask)
+        return panel
+
+    def _place(self, group, widget, x, y):
+        group.append(self.canvas.create_window(x, y, window=widget))
 
     def _build_ui(self):
-        # tenta carregar o background; se falhar cria um background neutro
         try:
-            self._orig_bg = Image.open("imagens/background.png").convert("RGB")
-        except Exception:
-            self._orig_bg = Image.new("RGB", (1020, 580), (50, 50, 50))
+            bg = Image.open("imagens/background.png").convert("RGB")
+        except (OSError, ValueError):
+            bg = Image.new("RGB", (self.W, self.H), (50, 50, 50))
 
-        # Canvas que conterá o fundo e os widgets
-        w, h = 1020, 580
-        self.canvas = tk.Canvas(self, width=w, height=h, highlightthickness=0)
-        self.canvas.pack(fill='both', expand=True)
+        self.canvas = tk.Canvas(self, width=self.W, height=self.H, highlightthickness=0)
+        self.canvas.pack(fill="both", expand=True)
 
-        # imagem de fundo (referência guardada em self para evitar GC)
-        self._bg_photo = ImageTk.PhotoImage(self._orig_bg.resize((w, h), Image.LANCZOS))
-        self._bg_id = self.canvas.create_image(0, 0, anchor='nw', image=self._bg_photo)
+        # referências guardadas em self para evitar coleta de lixo
+        self._bg_photo = ImageTk.PhotoImage(bg.resize((self.W, self.H), Image.LANCZOS))
+        self.canvas.create_image(0, 0, anchor="nw", image=self._bg_photo)
 
-        # painel semi-transparente (card) no centro
-        panel_w, panel_h = 360, 320
-        overlay = self._make_rounded_panel(panel_w, panel_h, radius=12, alpha=220, color=(240,240,240))
-        self._overlay_photo = ImageTk.PhotoImage(overlay)
-        cx, cy = w // 2, h // 2
-        self._panel_id = self.canvas.create_image(cx, cy, image=self._overlay_photo)
+        cx, cy = self.W // 2, self.H // 2
+        panel = self._make_rounded_panel(self.PANEL_W, self.PANEL_H)
+        self._panel_photo = ImageTk.PhotoImage(panel)
+        self.canvas.create_image(cx, cy, image=self._panel_photo)
 
-        # abas simples (botões) - posicionados sobre o painel
-        b_login = tk.Button(self, text="Login", relief="flat", command=lambda: self._show_tab("login"))
-        b_register = tk.Button(self, text="Cadastro", relief="flat", command=lambda: self._show_tab("register"))
-        self._tab_login_id = self.canvas.create_window(cx - 60, cy - panel_h//2 + 16, window=b_login)
-        self._tab_register_id = self.canvas.create_window(cx + 40, cy - panel_h//2 + 16, window=b_register)
-
-        # --- Widgets de Login ---
-        entries_login = {}
-        lbl_e = tk.Label(self, text="E-mail:")
-        ent_e = tk.Entry(self, width=30)
-        lbl_s = tk.Label(self, text="Senha:")
-        ent_s = tk.Entry(self, width=30, show="*")
-        btn_login = tk.Button(self, text="Login", width=12, command=lambda e=entries_login: self._do_login(e))
-
-        # posicionamento (coord relativas ao centro do painel)
-        base_y = cy - 40
-        self._login_ids = {
-            "lbl_e": self.canvas.create_window(cx, base_y - 40, window=lbl_e),
-            "ent_e": self.canvas.create_window(cx, base_y - 20, window=ent_e),
-            "lbl_s": self.canvas.create_window(cx, base_y + 10, window=lbl_s),
-            "ent_s": self.canvas.create_window(cx, base_y + 30, window=ent_s),
-            "btn": self.canvas.create_window(cx, base_y + 90, window=btn_login)
+        # abas (botões) sobre o painel
+        tab_y = cy - self.PANEL_H // 2 + 16
+        self._tab_buttons = {
+            "login": tk.Button(self, text="Login", relief="flat", command=lambda: self._show_tab("login")),
+            "register": tk.Button(self, text="Cadastro", relief="flat", command=lambda: self._show_tab("register")),
         }
-        entries_login["E-mail"] = ent_e
-        entries_login["Senha"] = ent_s
-        self._entries_login = entries_login
+        self.canvas.create_window(cx - 60, tab_y, window=self._tab_buttons["login"])
+        self.canvas.create_window(cx + 40, tab_y, window=self._tab_buttons["register"])
 
-        # --- limitar caracteres de telefone ---
-        vcmd = (self.register(lambda P: P.isdigit() and len(P) <= 11 or P == ""), "%P")
-
-        # --- Widgets de Cadastro ---
-        entries_reg = {}
-        spacing = 46
-        r_base = cy - 60
-        lbl_nome = tk.Label(self, text="Nome:")
-        ent_nome = tk.Entry(self, width=30)
-        lbl_email = tk.Label(self, text="E-mail:")
-        ent_email = tk.Entry(self, width=30)
-        lbl_tel = tk.Label(self, text="Telefone:")
-        ent_tel = tk.Entry(self, width=30, validate="key", validatecommand=vcmd)
-        lbl_pwd = tk.Label(self, text="Senha:")
-        ent_pwd = tk.Entry(self, width=30, show="*")
-        btn_reg = tk.Button(self, text="Cadastrar", width=12, command=lambda e=entries_reg: self._do_register(e))
-
-        self._reg_ids = {
-            "lbl_nome": self.canvas.create_window(cx, r_base - 4, window=lbl_nome),
-            "ent_nome": self.canvas.create_window(cx, r_base + 14, window=ent_nome),
-            "lbl_email": self.canvas.create_window(cx, r_base + spacing, window=lbl_email),
-            "ent_email": self.canvas.create_window(cx, r_base + spacing + 14, window=ent_email),
-            "lbl_tel": self.canvas.create_window(cx, r_base + spacing*2, window=lbl_tel),
-            "ent_tel": self.canvas.create_window(cx, r_base + spacing*2 + 14, window=ent_tel),
-            "lbl_pwd": self.canvas.create_window(cx, r_base + spacing*3, window=lbl_pwd),
-            "ent_pwd": self.canvas.create_window(cx, r_base + spacing*3 + 14, window=ent_pwd),
-            "btn": self.canvas.create_window(cx, r_base + spacing*4 + 6, window=btn_reg)
-        }
-        entries_reg["Nome"] = ent_nome
-        entries_reg["E-mail"] = ent_email
-        entries_reg["Telefone"] = ent_tel
-        entries_reg["Senha"] = ent_pwd
-        self._entries_reg = entries_reg
-
-        # mostra login por padrão
+        self._login_items, self._reg_items = [], []
+        self._build_login(cx, cy)
+        self._build_register(cx, cy)
         self._show_tab("login")
 
+    def _label(self, text):
+        return tk.Label(self, text=text, bg=PANEL_BG)
+
+    def _build_login(self, cx, cy):
+        base_y = cy - 40
+        self._login_entries = {
+            "E-mail": tk.Entry(self, width=30),
+            "Senha": tk.Entry(self, width=30, show="*"),
+        }
+        self._place(self._login_items, self._label("E-mail:"), cx, base_y - 40)
+        self._place(self._login_items, self._login_entries["E-mail"], cx, base_y - 20)
+        self._place(self._login_items, self._label("Senha:"), cx, base_y + 10)
+        self._place(self._login_items, self._login_entries["Senha"], cx, base_y + 30)
+        self._place(self._login_items, tk.Button(self, text="Login", width=12, command=self._do_login), cx, base_y + 90)
+
+        for entry in self._login_entries.values():
+            entry.bind("<Return>", lambda _e: self._do_login())
+
+    def _build_register(self, cx, cy):
+        # telefone: apenas dígitos, até 11 caracteres
+        vcmd = (self.register(lambda p: p == "" or (p.isdigit() and len(p) <= 11)), "%P")
+
+        r_base, spacing = cy - 60, 46
+        fields = [
+            ("Nome", "Nome:", {}),
+            ("E-mail", "E-mail:", {}),
+            ("Telefone", "Telefone:", {"validate": "key", "validatecommand": vcmd}),
+            ("Senha", "Senha:", {"show": "*"}),
+        ]
+        self._reg_entries = {}
+        for i, (key, text, opts) in enumerate(fields):
+            entry = tk.Entry(self, width=30, **opts)
+            self._reg_entries[key] = entry
+            self._place(self._reg_items, self._label(text), cx, r_base - 4 + spacing * i)
+            self._place(self._reg_items, entry, cx, r_base + 14 + spacing * i)
+            entry.bind("<Return>", lambda _e: self._do_register())
+
+        self._place(
+            self._reg_items,
+            tk.Button(self, text="Cadastrar", width=12, command=self._do_register),
+            cx,
+            r_base + spacing * 4 + 6,
+        )
+
     def _show_tab(self, name):
-        # mostra/oculta widgets de login e registro
-        for k, id_ in self._login_ids.items():
+        for id_ in self._login_items:
             self.canvas.itemconfigure(id_, state="normal" if name == "login" else "hidden")
-        for k, id_ in self._reg_ids.items():
+        for id_ in self._reg_items:
             self.canvas.itemconfigure(id_, state="normal" if name == "register" else "hidden")
+        for key, btn in self._tab_buttons.items():
+            btn.config(relief="sunken" if key == name else "flat")
+        first = self._login_entries["E-mail"] if name == "login" else self._reg_entries["Nome"]
+        first.focus_set()
 
-    # Cadastro de novo usuário
-    def _do_register(self, entries):
-        nome = entries['Nome'].get().strip()
-        email = entries['E-mail'].get().strip()
-        tel = entries['Telefone'].get().strip()
-        pwd = entries['Senha'].get().strip()
-        # Validações básicas
-        if not nome or not re.match(r"[^@]+@[^@]+\.[^@]+", email) or not pwd:
-            return messagebox.showwarning("Erro", "Preencha corretamente todos os campos.")
-        if self.db.get_user_by_email(email):
+    # --- cadastro -----------------------------------------------------------
+    def _do_register(self):
+        e = self._reg_entries
+        nome = e["Nome"].get().strip()
+        email = e["E-mail"].get().strip().lower()
+        tel = e["Telefone"].get().strip()
+        pwd = e["Senha"].get()  # senha não sofre strip
+
+        if not nome:
+            return messagebox.showwarning("Erro", "Informe o nome.")
+        if not re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", email):
+            return messagebox.showwarning("Erro", "Informe um e-mail válido.")
+        if tel and len(tel) < 10:
+            return messagebox.showwarning("Erro", "Telefone deve ter DDD + número (10 ou 11 dígitos).")
+        if len(pwd) < MIN_PASSWORD_LEN:
+            return messagebox.showwarning("Erro", f"A senha deve ter ao menos {MIN_PASSWORD_LEN} caracteres.")
+        if email == OWNER_EMAIL.lower() or self.db.get_user_by_email(email):
             return messagebox.showwarning("Erro", "E-mail já cadastrado.")
-        self.db.add_user(nome, email, tel, hash_password(pwd))
-        messagebox.showinfo("Sucesso", "Cadastro realizado com sucesso.")
-        for e in entries.values():
-            e.delete(0, tk.END)
 
-    # Login de usuário ou dono
-    def _do_login(self, entries):
-        email = entries['E-mail'].get().strip()
-        pwd = entries['Senha'].get().strip()
+        try:
+            self.db.add_user(nome, email, tel, hash_password(pwd))
+        except sqlite3.IntegrityError:
+            return messagebox.showwarning("Erro", "E-mail já cadastrado.")
+
+        messagebox.showinfo("Sucesso", "Cadastro realizado com sucesso.")
+        for entry in e.values():
+            entry.delete(0, tk.END)
+        self._show_tab("login")
+        self._login_entries["E-mail"].insert(0, email)
+        self._login_entries["Senha"].focus_set()
+
+    # --- login --------------------------------------------------------------
+    def _do_login(self):
+        email = self._login_entries["E-mail"].get().strip()
+        pwd = self._login_entries["Senha"].get()
         if not email or not pwd:
             return messagebox.showwarning("Erro", "Preencha todos os campos.")
-        # Login do dono
-        if email == EMAIL_DONO and hash_password(pwd) == SENHA_DONO_HASH:
+
+        if is_owner(email, pwd):
             AppointmentWindow(self, self.db)
         else:
-            # Login de usuário cadastrado
             user = self.db.get_user_by_email(email)
-            if user and hash_password(pwd) == user[4]:
+            if user and verify_password(pwd, user[4]):
+                if needs_rehash(user[4]):  # migra hashes antigos para PBKDF2
+                    self.db.update_password_hash(user[0], hash_password(pwd))
                 AppointmentWindow(self, self.db, user)
             else:
                 messagebox.showerror("Erro", "E-mail ou senha incorretos.")
 
+        self._login_entries["Senha"].delete(0, tk.END)
 
-# Inicializa a aplicação
+
 if __name__ == "__main__":
     LoginApp().mainloop()
