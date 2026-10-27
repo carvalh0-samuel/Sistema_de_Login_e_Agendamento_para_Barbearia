@@ -7,7 +7,7 @@
 ## 📸 Demonstração
 
 <div align="center">
- <img src="./screenshots/Screenshot_1.png" alt="Tela Principal" width="700" style="border-radius: 8px;">
+<img src="./screenshots/Screenshot_1.png" alt="Tela Principal" width="500" style="border-radius: 8px;"> <img src="./screenshots/Screenshot_2.png" alt="Tela Principal" width="500" style="border-radius: 8px;"> <img src="./screenshots/Screenshot_3.png" alt="Tela Principal" width="500" style="border-radius: 8px;"> <img src="./screenshots/Screenshot_4.png" alt="Tela Principal" width="500" style="border-radius: 8px;">
 </div>
 
 ---
